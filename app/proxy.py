@@ -7,7 +7,9 @@ caller's Authorization header unchanged (rejecting calls without one) and transl
   up   response.create    remember metadata (FIFO); serialise while a response is active; OWUI status lines are
                           rewritten to a verbatim Chinese sentence (Qwen ignores conversation:'none')
   up   item.create(id)    remember the client id; Qwen assigns its own id
-  up   item.delete        rewrite client id -> Qwen id (Qwen acks any id, so an unmapped delete would silently leak)
+  up   item.delete        rewrite client id -> Qwen id (Qwen acks any id, so an unmapped delete would silently leak),
+                          deferred while a response or speech is in flight (else Qwen fails with InternalError)
+  up   bare response.create  dropped when the session set create_response: false (LiteLLM injects one per turn)
   up   item.truncate      not forwarded (Qwen never answers); a synthetic conversation.item.truncated is returned
   down response.audio.*             -> response.output_audio.*
   down response.audio_transcript.*  -> response.output_audio_transcript.*
@@ -73,21 +75,31 @@ class Translator:
         self.after_item = False  # last upstream command was an item.create (Qwen queues those itself)
         self.pending_ids = collections.deque()  # client item ids awaiting conversation.item.created
         self.ids = {}  # client item id -> upstream item id
+        self.speaking = False  # VAD heard speech whose transcription has not finished
+        self.client_drives_responses = False  # session asked for create_response: false (Open WebUI Bridge)
+        self.deferred = []  # item ids to delete once nothing in flight can reference them (ADR 6)
 
     # ---- client -> upstream
     def up(self, ev):
         kind = ev.get("type")
+        if kind == "session.update":
+            detection = (((ev.get("session") or {}).get("audio") or {}).get("input") or {}).get("turn_detection") \
+                or (ev.get("session") or {}).get("turn_detection") or {}
+            if "create_response" in detection:
+                self.client_drives_responses = detection["create_response"] is False
         if kind == "response.create":
+            if self.client_drives_responses and not ev.get("response"):
+                # LiteLLM's realtime relay sends a bare response.create after every transcription (ADR 7). The client
+                # asked to drive responses itself and always sends its own with a body, so this one is a duplicate.
+                return [], []
             return self._response_create(ev), []
         self.after_item = kind == "conversation.item.create"
         if kind == "conversation.item.create":
             self.pending_ids.append(ev.get("item", {}).pop("id", None))
             return [ev], []
         if kind == "conversation.item.delete":
-            item_id = ev.get("item_id")
-            if item_id in self.ids:
-                ev = {**ev, "item_id": self.ids.pop(item_id)}
-            return [ev], []
+            self.deferred.append(ev.get("item_id"))
+            return self._flush_deletes(), []
         if kind == "conversation.item.truncate":
             return [], [{"type": "conversation.item.truncated", "item_id": ev.get("item_id"),
                          "content_index": ev.get("content_index", 0), "audio_end_ms": ev.get("audio_end_ms", 0)}]
@@ -107,6 +119,23 @@ class Translator:
         self.pending.append(ev)
         return [ev]
 
+    def _flush_deletes(self):
+        """Deletes that are safe now. Qwen anchors new items (VAD speech, queued responses) on the latest item;
+        deleting that item while one of them is in flight ends the session with InternalError
+        "previous item id does not exist". So wait until no response is active or held and no speech is open."""
+        if self.active or self.held or self.speaking:
+            return []
+        out, keep = [], []
+        for item_id in self.deferred:
+            if item_id in self.ids:
+                out.append({"type": "conversation.item.delete", "item_id": self.ids.pop(item_id)})
+            elif item_id in self.pending_ids:
+                keep.append(item_id)  # its conversation.item.created has not arrived yet
+            else:
+                out.append({"type": "conversation.item.delete", "item_id": item_id})
+        self.deferred = keep
+        return out
+
     # ---- upstream -> client
     def down(self, ev):
         kind = ev.get("type", "")
@@ -119,6 +148,12 @@ class Translator:
             return [], []
         if kind in RENAME:
             ev = {**ev, "type": RENAME[kind]}
+        elif kind == "input_audio_buffer.speech_started":
+            self.speaking = True
+        elif kind in ("conversation.item.input_audio_transcription.completed",
+                      "conversation.item.input_audio_transcription.failed", "input_audio_buffer.cleared"):
+            self.speaking = False
+            to_up = self._flush_deletes()
         elif kind == "conversation.item.created":
             item = ev.get("item") or {}
             # Items Qwen creates itself (response output, VAD speech) arrive in_progress; client item.create acks
@@ -138,6 +173,7 @@ class Translator:
             self.active = bool(self.pending)
             if not self.active and self.held:
                 to_up = self._response_create(self.held.popleft())
+            to_up += self._flush_deletes()
         return to_up, [ev]
 
 

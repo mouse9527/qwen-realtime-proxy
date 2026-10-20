@@ -240,3 +240,79 @@ def test_scrub_keeps_error_text_but_not_credentials():
     assert scrub("x" * 500 + "\n") == "<redacted>"
     assert len(scrub("word " * 100)) == 200
     assert scrub(None) is None
+
+
+OVERLAP = [json.loads(line) for line in (FIXTURE.parent / "overlap-internalerror.jsonl").read_text().splitlines()]
+
+
+def test_snapshot_delete_deferred_while_speech_or_response_in_flight():
+    """Real session that ended in InternalError "previous item id does not exist" (second utterance began while the
+    first turn's response was queued). Replay up to the point Qwen failed: the proxy must not have deleted the
+    snapshot that the in-flight speech / queued response were anchored on."""
+    tr = Translator()
+    sent_deletes = []
+    for row in OVERLAP:
+        ev = json.loads(json.dumps(row["ev"]))
+        if row["dir"] == "down" and ev["type"] == "error":
+            break  # Qwen failed here in the recording
+        up, _ = (tr.up if row["dir"] == "up" else tr.down)(ev)
+        for out in up:
+            if out["type"] == "conversation.item.delete":
+                assert not tr.speaking and not tr.active, "delete sent while speech/response in flight"
+                sent_deletes.append(out["item_id"])
+    # The first delete (snapshot 1) happened in a quiet moment in the original run too... it must now wait as well,
+    # because the first user turn's response was already requested when it arrived.
+    culprit = "item_ZZ1uMp72iB3IHnyWw2bOn"  # snapshot 2, the id Qwen reported as missing
+    assert culprit not in sent_deletes
+    assert tr.deferred, "deletes are queued, not dropped"
+    # Once every queued response has finished and no speech is open, the deferred deletes go out (no context leak).
+    flushed = []
+    while tr.pending:
+        rid = f"r-late-{len(tr.pending)}"
+        tr.down({"type": "response.created", "response": {"id": rid}})
+        up, _ = tr.down({"type": "response.done", "response": {"id": rid, "status": "completed"}})
+        flushed += [e["item_id"] for e in up if e["type"] == "conversation.item.delete"]
+    assert culprit in flushed and not tr.deferred and not tr.speaking
+
+
+def test_delete_goes_out_immediately_when_quiet():
+    tr = Translator()
+    tr.up({"type": "conversation.item.create", "item": {"id": "chat_context_1", "type": "message", "role": "system", "content": []}})
+    tr.down({"type": "conversation.item.created", "item": {"id": "item_S1", "status": "completed", "role": "system"}})
+    up, _ = tr.up({"type": "conversation.item.delete", "item_id": "chat_context_1"})
+    assert up == [{"type": "conversation.item.delete", "item_id": "item_S1"}]
+
+
+def test_delete_waits_for_open_speech_then_flushes_on_transcription():
+    tr = Translator()
+    tr.down({"type": "input_audio_buffer.speech_started", "item_id": "u1"})
+    up, _ = tr.up({"type": "conversation.item.delete", "item_id": "x"})
+    assert up == []
+    up, _ = tr.down({"type": "conversation.item.input_audio_transcription.completed", "item_id": "u1", "transcript": "hi"})
+    assert up == [{"type": "conversation.item.delete", "item_id": "x"}]
+
+
+def _session(create_response):
+    detection = {"type": "server_vad"} if create_response is None else {"type": "server_vad", "create_response": create_response}
+    return {"type": "session.update", "session": {"type": "realtime", "audio": {"input": {"turn_detection": detection}}}}
+
+
+def test_bare_response_create_dropped_when_client_drives_responses():
+    """LiteLLM 1.106.0 sends {"type": "response.create"} after every transcription; Open WebUI sends its own with
+    metadata. Only the client's must reach Qwen, or each turn is answered twice and metadata pairing drifts."""
+    tr = Translator()
+    tr.up(_session(False))
+    assert tr.up({"type": "response.create"}) == ([], [])
+    assert tr.up({"type": "response.create", "response": None}) == ([], [])
+    up, _ = tr.up({"type": "response.create", "response": {"metadata": {"input_item_id": "u1"}}})
+    assert len(up) == 1 and len(tr.pending) == 1
+    _, out = tr.down({"type": "response.created", "response": {"id": "r1"}})
+    assert out[0]["response"]["metadata"] == {"input_item_id": "u1"}
+
+
+def test_bare_response_create_kept_when_server_or_client_left_auto_response_on():
+    for create_response in (None, True):
+        tr = Translator()
+        tr.up(_session(create_response))
+        up, _ = tr.up({"type": "response.create"})
+        assert up == [{"type": "response.create"}]

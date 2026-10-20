@@ -16,6 +16,8 @@ against the live service (see `docs/adr/`):
 | `conversation.item.truncate` → `conversation.item.truncated` | never answers | answers locally, does not forward — [ADR 3](docs/adr/0003-synthesise-truncated.md) |
 | `conversation: "none"` status lines are spoken out of band | answers from the full history instead | rewrites the three Open WebUI status lines to a verbatim Chinese sentence — [ADR 4](docs/adr/0004-rewrite-status-lines.md) |
 | a second `response.create` while one is active is fine | rejects it unless it follows an item create | holds it until `response.done` |
+| deleting an item is always safe | fails the session (`InternalError: previous item id does not exist`) if a queued response or open speech is anchored on it | defers deletes until the turn settles — [ADR 6](docs/adr/0006-defer-item-deletes.md) |
+| only the client creates responses (`create_response: false`) | LiteLLM injects a bare `response.create` after every transcription | drops bare creates in that mode — [ADR 7](docs/adr/0007-drop-litellm-bare-response-create.md) |
 
 The proxy **holds no credentials**: it forwards the caller's `Authorization` header to Qwen unchanged and refuses a
 call without one ([ADR 5](docs/adr/0005-no-credentials-in-the-proxy.md)). The intended deployment puts LiteLLM in
