@@ -21,6 +21,7 @@ import collections
 import json
 import logging
 import os
+import re
 import time
 from urllib.parse import urlencode
 
@@ -47,6 +48,17 @@ STATUS_LINES = {
 MAX_MESSAGE = 512 * 1024
 CFG = web.AppKey("cfg", dict)
 HTTP = web.AppKey("http", ClientSession)
+
+
+# Authorization values, "sk"-prefixed keys, key=value pairs and any long token-like run.
+_SECRETS = re.compile(r"(?i)(bearer\s+\S+|s[k]-[A-Za-z0-9_-]{6,}|api[_-]?key\S*\s*[:=]\s*\S+|[A-Za-z0-9+/_=-]{32,})")
+
+
+def scrub(message, limit=200):
+    """Upstream error text for the log: credential-like runs replaced, newlines folded, truncated."""
+    if not isinstance(message, str):
+        return None
+    return _SECRETS.sub("<redacted>", " ".join(message.split()))[:limit]
 
 
 class Translator:
@@ -176,8 +188,9 @@ async def realtime(request):
             kind = ev.get("type", "?")
             counts["down:" + kind] += 1
             if kind == "error":
-                log.info("upstream error type=%s code=%s", (ev.get("error") or {}).get("type"),
-                         (ev.get("error") or {}).get("code"))
+                err = ev.get("error") or {}
+                log.info("upstream error type=%s code=%s message=%s", err.get("type"), err.get("code"),
+                         scrub(err.get("message")))
             to_up, to_client = tr.down(ev)
             for out in to_up:
                 await upstream.send_str(json.dumps(out, ensure_ascii=False))

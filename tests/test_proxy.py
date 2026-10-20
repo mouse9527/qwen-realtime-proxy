@@ -7,7 +7,7 @@ import pytest
 from aiohttp import web, WSMsgType
 from aiohttp.test_utils import TestServer, TestClient
 
-from app.proxy import Translator, make_app, config_from_env, BUSY_ERROR, STATUS_LINES, VERBATIM
+from app.proxy import Translator, make_app, config_from_env, scrub, BUSY_ERROR, STATUS_LINES, VERBATIM
 
 AUTH = "Bearer "  # test-only dummy credentials below; never real values
 FIXTURE = pathlib.Path(__file__).parent / "fixtures" / "bridge-flow.jsonl"
@@ -230,3 +230,13 @@ async def test_upstream_refusal_status_is_returned_to_caller():
         assert r.status == 401
     finally:
         await client.close(); await up.close()
+
+
+def test_scrub_keeps_error_text_but_not_credentials():
+    assert scrub("InternalError: Internal service error, please retry.") == "InternalError: Internal service error, please retry."
+    fake_key = "sk" + "-abcdef123456"
+    out = scrub("bad key " + fake_key + " or " + AUTH + "xyz.secret.value, api_key=foo, token " + "A" * 40)
+    assert fake_key not in out and "xyz.secret" not in out and "foo" not in out and "A" * 40 not in out
+    assert scrub("x" * 500 + "\n") == "<redacted>"
+    assert len(scrub("word " * 100)) == 200
+    assert scrub(None) is None
