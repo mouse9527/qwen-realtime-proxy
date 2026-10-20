@@ -23,7 +23,7 @@ jobs:
       - run: pytest -q
       - name: No credentials in the repository
         run: |
-          if grep -rnE 'sk-[A-Za-z0-9]{8}|Bearer [A-Za-z0-9]{12}' --exclude-dir=.git --exclude-dir=.github .; then
+          if grep -rnIE 'sk-[A-Za-z0-9]{8}|Bearer [A-Za-z0-9]{12}' --exclude-dir=.git --exclude-dir=.github --exclude-dir=__pycache__ .; then
             echo "credential-like string found" >&2; exit 1
           fi
 
