@@ -1,0 +1,94 @@
+name: image
+
+on:
+  push:
+    branches: [main]
+    tags: ['v*']
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: '3.13'
+          cache: pip
+      - run: pip install -r requirements-dev.txt
+      - run: pytest -q
+      - name: No credentials in the repository
+        run: |
+          if grep -rnE 'sk-[A-Za-z0-9]{8}|Bearer [A-Za-z0-9]{12}' --exclude-dir=.git --exclude-dir=.github .; then
+            echo "credential-like string found" >&2; exit 1
+          fi
+
+  image:
+    needs: test
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+
+      - id: meta
+        uses: docker/metadata-action@dc802804100637a589fabce1cb79ff13a1411302 # v6.2.0
+        with:
+          images: ghcr.io/${{ github.repository }}
+          tags: |
+            type=sha,prefix=sha-
+            type=ref,event=tag
+            type=raw,value=latest,enable={{is_default_branch}}
+
+      # Build amd64 into the local daemon first; push only after the smoke test passes.
+      - uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
+        with:
+          context: .
+          platforms: linux/amd64
+          load: true
+          tags: smoke:local
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Smoke test
+        run: |
+          set -eu
+          # 1. Refuses to start without secrets, naming only the missing variables.
+          if out=$(docker run --rm --read-only smoke:local 2>&1); then
+            echo "started without secrets" >&2; exit 1
+          fi
+          echo "$out" | grep -q 'missing required environment variables: UPSTREAM_URL, UPSTREAM_KEY, PROXY_TOKEN'
+          # 2. Starts read-only as uid 1000 and serves /healthz.
+          docker run -d --name smoke --read-only --cap-drop ALL --security-opt no-new-privileges \
+            -e UPSTREAM_URL=wss://example.invalid/api-ws/v1/realtime -e UPSTREAM_KEY=dummy-upstream -e PROXY_TOKEN=dummy-token \
+            -p 18080:8080 smoke:local
+          for i in $(seq 1 20); do curl -fsS http://127.0.0.1:18080/healthz && break; sleep 1; done
+          test "$(curl -s -o /dev/null -w '%{http_code}' http://127.0.0.1:18080/healthz)" = 200
+          test "$(docker exec smoke id -u)" = 1000
+          # 3. Realtime endpoint rejects a wrong token; secrets never reach the log.
+          test "$(curl -s -o /dev/null -w '%{http_code}' -H 'Authorization: Bearer wrong' http://127.0.0.1:18080/v1/realtime)" = 401
+          if docker logs smoke 2>&1 | grep -q -e dummy-upstream -e dummy-token; then echo "secret in log" >&2; exit 1; fi
+          docker rm -f smoke
+
+      - if: github.event_name == 'push'
+        uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - if: github.event_name == 'push'
+        name: Push
+        env:
+          TAGS: ${{ steps.meta.outputs.tags }}
+        run: |
+          set -eu
+          for tag in $TAGS; do docker tag smoke:local "$tag"; docker push "$tag"; done
+          first=$(echo "$TAGS" | head -n1)
+          echo "digest: $(docker inspect --format '{{index .RepoDigests 0}}' "$first")" | tee -a "$GITHUB_STEP_SUMMARY"
