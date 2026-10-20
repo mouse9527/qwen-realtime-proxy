@@ -17,6 +17,14 @@ against the live service (see `docs/adr/`):
 | `conversation: "none"` status lines are spoken out of band | answers from the full history instead | rewrites the three Open WebUI status lines to a verbatim Chinese sentence — [ADR 4](docs/adr/0004-rewrite-status-lines.md) |
 | a second `response.create` while one is active is fine | rejects it unless it follows an item create | holds it until `response.done` |
 
+The proxy **holds no credentials**: it forwards the caller's `Authorization` header to Qwen unchanged and refuses a
+call without one ([ADR 5](docs/adr/0005-no-credentials-in-the-proxy.md)). The intended deployment puts LiteLLM in
+front, so the Model Studio key lives in LiteLLM like every other model key:
+
+```
+Open WebUI ──/v1/realtime──► LiteLLM (model key) ──► qwen-realtime-proxy ──► Qwen-Omni-Realtime
+```
+
 Everything else is passed through unchanged. Any other upstream `error` is forwarded (Open WebUI ends the call on
 any error, so only the one error shown above to be harmless is absorbed).
 
@@ -25,16 +33,29 @@ any error, so only the one error shown above to be harmless is absorbed).
 | Variable | Required | Default | Meaning |
 |---|---|---|---|
 | `UPSTREAM_URL` | yes | — | `wss://<workspace-id>.cn-beijing.maas.aliyuncs.com/api-ws/v1/realtime` (no query string; the model comes from the client) |
-| `UPSTREAM_KEY` | yes | — | Model Studio (DashScope) API key. Sent only to `UPSTREAM_URL` |
-| `PROXY_TOKEN` | yes | — | Shared secret Open WebUI presents as `Authorization: Bearer …`. Never forwarded upstream |
 | `DEFAULT_MODEL` | no | `qwen3.8-omni-flash-realtime` | Used when the client sends no `?model=` |
 | `STATUS_PREFIX` | no | `请用中文说。` | Prepended to unknown out-of-band status lines |
 | `HOST` / `PORT` | no | `0.0.0.0` / `8080` | Listen address |
 | `LOG_LEVEL` | no | `INFO` | |
 
-The process exits immediately, naming only the missing variables, if a required one is unset or empty.
+The process exits immediately, naming the variable, if `UPSTREAM_URL` is unset or empty.
 
 Endpoints: `GET /v1/realtime` and `GET /realtime` (WebSocket), `GET /healthz`.
+
+## LiteLLM model
+
+Add a model (UI or DB; LiteLLM ≥ 1.106.0 verified):
+
+| Field | Value |
+|---|---|
+| Public model name | `qwen3.8-omni-flash-realtime` |
+| LiteLLM model | `openai/qwen3.8-omni-flash-realtime` (the `openai/` prefix is stripped before it reaches the proxy) |
+| API base | `http://<proxy-host>:8080` — **no `/v1`**: LiteLLM's OpenAI realtime handler always sets the path to `/v1/realtime` |
+| API key | the Model Studio key for the workspace in `UPSTREAM_URL` |
+| Mode | `realtime` |
+
+LiteLLM sends that key upstream as `Authorization: Bearer …`; the caller's LiteLLM key never reaches the proxy.
+LiteLLM also probes `GET <api base>/v1/models`; the proxy answers 404, which is harmless.
 
 ## Open WebUI settings
 
@@ -44,20 +65,23 @@ Admin → Settings → Audio → Voice calls:
 |---|---|
 | Call mode | Realtime |
 | Provider | OpenAI |
-| API Base URL | `http://<proxy-host>:8080/v1` (Open WebUI appends `/realtime?model=…`) |
-| API Key | the `PROXY_TOKEN` value |
-| Voice Model | `qwen3.8-omni-flash-realtime` (`qwen3.5-omni-*-realtime` also work; **not** `qwen-audio-3.1-realtime-plus`, which ignores `create_response: false`) |
-| Transcription Model | `qwen3-asr-flash-realtime` |
+| API Base URL | your LiteLLM base, e.g. `https://litellm.example/v1` (Open WebUI appends `/realtime?model=…`) |
+| API Key | a LiteLLM key allowed to use the model |
+| Voice Model | the LiteLLM model name, e.g. `qwen3.8-omni-flash-realtime` (`qwen3.5-omni-*-realtime` also work; **not** `qwen-audio-3.1-realtime-plus`, which ignores `create_response: false`) |
+| Transcription Model | `qwen3-asr-flash-realtime` (sent inside the session, not routed by LiteLLM) |
 | Voice | e.g. `Tina` |
+
+Without LiteLLM, point Open WebUI straight at `http://<proxy-host>:8080/v1` and put the Model Studio key in its API Key
+field.
 
 ## Security
 
-- The upstream key lives only in the proxy's environment; the browser and Open WebUI never see it.
+- No secrets in the proxy: the caller's bearer token is forwarded to `UPSTREAM_URL` only, never logged, never stored.
+  Restrict who can reach the proxy at the network level (e.g. a NetworkPolicy that admits only LiteLLM).
 - Logs contain event types, counts and timings only — no audio, transcripts, tokens or keys. The HTTP access log is
   disabled.
 - The image runs as uid 1000, needs no writable filesystem and no capabilities.
 - Messages are capped at 512 KiB; upstream connect errors are reported by type, never by text.
-- Put it on a private network: it is meant to be reached by Open WebUI only.
 
 ## Development
 

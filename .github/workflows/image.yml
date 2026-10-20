@@ -59,21 +59,24 @@ jobs:
       - name: Smoke test
         run: |
           set -eu
-          # 1. Refuses to start without secrets, naming only the missing variables.
+          # 1. Refuses to start without its upstream, naming only the missing variable.
           if out=$(docker run --rm --read-only smoke:local 2>&1); then
-            echo "started without secrets" >&2; exit 1
+            echo "started without UPSTREAM_URL" >&2; exit 1
           fi
-          echo "$out" | grep -q 'missing required environment variables: UPSTREAM_URL, UPSTREAM_KEY, PROXY_TOKEN'
+          echo "$out" | grep -q 'missing required environment variables: UPSTREAM_URL'
           # 2. Starts read-only as uid 1000 and serves /healthz.
           docker run -d --name smoke --read-only --cap-drop ALL --security-opt no-new-privileges \
-            -e UPSTREAM_URL=wss://example.invalid/api-ws/v1/realtime -e UPSTREAM_KEY=dummy-upstream -e PROXY_TOKEN=dummy-token \
+            -e UPSTREAM_URL=wss://example.invalid/api-ws/v1/realtime \
             -p 18080:8080 smoke:local
           for i in $(seq 1 20); do curl -fsS http://127.0.0.1:18080/healthz && break; sleep 1; done
           test "$(curl -s -o /dev/null -w '%{http_code}' http://127.0.0.1:18080/healthz)" = 200
           test "$(docker exec smoke id -u)" = 1000
-          # 3. Realtime endpoint rejects a wrong token; secrets never reach the log.
-          test "$(curl -s -o /dev/null -w '%{http_code}' -H 'Authorization: Bearer wrong' http://127.0.0.1:18080/v1/realtime)" = 401
-          if docker logs smoke 2>&1 | grep -q -e dummy-upstream -e dummy-token; then echo "secret in log" >&2; exit 1; fi
+          # 3. Realtime endpoint refuses a call without a bearer token (the proxy holds no credentials).
+          test "$(curl -s -o /dev/null -w '%{http_code}' http://127.0.0.1:18080/v1/realtime)" = 401
+          # 4. A caller's token is not logged even when the upstream is unreachable.
+          curl -s -o /dev/null -H 'Authorization: Bearer smoke-caller-token' -H 'Connection: Upgrade' -H 'Upgrade: websocket' \
+            -H 'Sec-WebSocket-Version: 13' -H 'Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==' http://127.0.0.1:18080/v1/realtime || true
+          if docker logs smoke 2>&1 | grep -q smoke-caller-token; then echo "token in log" >&2; exit 1; fi
           docker rm -f smoke
 
       - if: github.event_name == 'push'

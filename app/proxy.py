@@ -1,7 +1,8 @@
 """OpenAI Realtime GA (as spoken by Open WebUI v0.12 "Bridge") <-> Qwen-Omni-Realtime proxy.
 
-Open WebUI connects to  ws(s)://<proxy>/v1/realtime?model=<name>  with  Authorization: Bearer <PROXY_TOKEN>.
-The proxy opens  UPSTREAM_URL?model=<name>  with  Authorization: Bearer <UPSTREAM_KEY>  and translates:
+A client (LiteLLM, or Open WebUI directly) connects to  ws(s)://<proxy>/v1/realtime?model=<name>  with
+Authorization: Bearer <Model Studio key>. The proxy holds no credentials: it opens  UPSTREAM_URL?model=<name>  with the
+caller's Authorization header unchanged (rejecting calls without one) and translates:
 
   up   response.create    remember metadata (FIFO); serialise while a response is active; OWUI status lines are
                           rewritten to a verbatim Chinese sentence (Qwen ignores conversation:'none')
@@ -17,7 +18,6 @@ No audio, transcripts or keys are logged; only event types, counts and latencies
 """
 import asyncio
 import collections
-import hmac
 import json
 import logging
 import os
@@ -129,22 +129,23 @@ class Translator:
         return to_up, [ev]
 
 
-def _authorized(request, token):
+def _bearer(request):
     header = request.headers.get("Authorization", "")
-    return bool(token) and hmac.compare_digest(header.encode(), f"Bearer {token}".encode())
+    return header if header.startswith("Bearer ") and len(header) > len("Bearer ") else None
 
 
 async def realtime(request):
     cfg = request.app[CFG]
-    if not _authorized(request, cfg["token"]):
-        return web.Response(status=401, text="unauthorized")
+    authorization = _bearer(request)
+    if authorization is None:
+        return web.Response(status=401, text="missing bearer token")
     model = request.query.get("model") or cfg["default_model"]
     upstream_url = f'{cfg["upstream"]}?{urlencode({"model": model})}'
     client = web.WebSocketResponse(heartbeat=20, max_msg_size=MAX_MESSAGE)
     started = time.monotonic()
     session: ClientSession = request.app[HTTP]
     try:
-        upstream = await session.ws_connect(upstream_url, headers={"Authorization": f'Bearer {cfg["key"]}'},
+        upstream = await session.ws_connect(upstream_url, headers={"Authorization": authorization},
                                             heartbeat=20, max_msg_size=MAX_MESSAGE,
                                             timeout=ClientWSTimeout(ws_receive=None, ws_close=10))
     except Exception as exc:  # handshake status only; never the exception text (could echo headers)
@@ -217,7 +218,7 @@ def make_app(cfg):
     return app
 
 
-REQUIRED = ("UPSTREAM_URL", "UPSTREAM_KEY", "PROXY_TOKEN")
+REQUIRED = ("UPSTREAM_URL",)
 
 
 def config_from_env(env=os.environ):
@@ -229,8 +230,6 @@ def config_from_env(env=os.environ):
         raise SystemExit("UPSTREAM_URL must start with wss:// or ws://")
     return {
         "upstream": env["UPSTREAM_URL"].strip(),  # wss://<workspace>.cn-beijing.maas.aliyuncs.com/api-ws/v1/realtime
-        "key": env["UPSTREAM_KEY"].strip(),
-        "token": env["PROXY_TOKEN"].strip(),
         "default_model": env.get("DEFAULT_MODEL", "qwen3.8-omni-flash-realtime"),
         "status_prefix": env.get("STATUS_PREFIX", "请用中文说。"),
     }

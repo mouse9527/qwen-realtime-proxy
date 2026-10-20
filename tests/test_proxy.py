@@ -137,7 +137,7 @@ def test_other_errors_pass_through():
 # ---- socket-level: OWUI-like client -> proxy -> fake upstream replaying the recording
 
 async def fake_upstream(request):
-    assert request.headers["Authorization"] == AUTH + "upstream-secret"
+    assert request.headers["Authorization"] == AUTH + "caller-key"  # passed through unchanged
     assert request.query["model"] == "qwen3.8-omni-flash-realtime"
     ws = web.WebSocketResponse()
     await ws.prepare(request)
@@ -171,14 +171,16 @@ async def test_socket_roundtrip_against_fake_upstream():
     up_server = TestServer(up_app)
     await up_server.start_server()
     cfg = {"upstream": str(up_server.make_url("/api-ws/v1/realtime")).replace("http", "ws", 1),
-           "key": "upstream-secret", "token": "proxy-token", "default_model": "x", "status_prefix": ""}
+           "default_model": "x", "status_prefix": ""}
     client = TestClient(TestServer(make_app(cfg)))
     await client.start_server()
     try:
-        bad = await client.get("/v1/realtime?model=qwen3.8-omni-flash-realtime", headers={"Authorization": AUTH + "nope"})
-        assert bad.status == 401
+        bad = await client.get("/v1/realtime?model=qwen3.8-omni-flash-realtime")
+        assert bad.status == 401  # no bearer: refused before any upstream connection
+        empty = await client.get("/v1/realtime", headers={"Authorization": AUTH.strip()})
+        assert empty.status == 401
         ws = await client.ws_connect("/v1/realtime?model=qwen3.8-omni-flash-realtime",
-                                     headers={"Authorization": AUTH + "proxy-token"})
+                                     headers={"Authorization": AUTH + "caller-key"})
         received = []
 
         async def reader():
@@ -203,12 +205,28 @@ async def test_socket_roundtrip_against_fake_upstream():
         await up_server.close()
 
 
-def test_config_refuses_to_start_without_secrets_and_never_echoes_values():
+def test_config_requires_only_upstream_url_and_holds_no_credentials():
     with pytest.raises(SystemExit) as exc:
-        config_from_env({"UPSTREAM_URL": "wss://x/api-ws/v1/realtime", "UPSTREAM_KEY": "  ", "PROXY_TOKEN": "tok-value"})
-    assert str(exc.value) == "missing required environment variables: UPSTREAM_KEY"
+        config_from_env({"UPSTREAM_URL": "  "})
+    assert str(exc.value) == "missing required environment variables: UPSTREAM_URL"
     with pytest.raises(SystemExit) as exc:
-        config_from_env({"UPSTREAM_URL": "https://x", "UPSTREAM_KEY": "k", "PROXY_TOKEN": "t"})
+        config_from_env({"UPSTREAM_URL": "https://x"})
     assert "wss://" in str(exc.value)
-    cfg = config_from_env({"UPSTREAM_URL": "wss://x/r", "UPSTREAM_KEY": "k", "PROXY_TOKEN": "t"})
-    assert cfg["default_model"] == "qwen3.8-omni-flash-realtime"
+    cfg = config_from_env({"UPSTREAM_URL": "wss://x/r"})
+    assert cfg == {"upstream": "wss://x/r", "default_model": "qwen3.8-omni-flash-realtime", "status_prefix": "请用中文说。"}
+
+
+@pytest.mark.asyncio
+async def test_upstream_refusal_status_is_returned_to_caller():
+    async def refuse(request):
+        return web.Response(status=401)
+    up_app = web.Application(); up_app.router.add_get("/r", refuse)
+    up = TestServer(up_app); await up.start_server()
+    cfg = {"upstream": str(up.make_url("/r")).replace("http", "ws", 1), "default_model": "m", "status_prefix": ""}
+    client = TestClient(TestServer(make_app(cfg))); await client.start_server()
+    try:
+        r = await client.get("/v1/realtime", headers={"Authorization": AUTH + "bad-key", "Connection": "Upgrade",
+                             "Upgrade": "websocket", "Sec-WebSocket-Version": "13", "Sec-WebSocket-Key": "dGhlIHNhbXBsZSBub25jZQ=="})
+        assert r.status == 401
+    finally:
+        await client.close(); await up.close()
